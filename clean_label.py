@@ -15,19 +15,34 @@ def clean_specific_label(input_path, output_path, target_label):
         sys.exit(1)
 
     try:
+        # Load the multi-label segmentation image
         print(f"Loading '{input_path}'...")
         img = sitk.ReadImage(input_path)
 
-        # SPLIT
+        # SPLIT: isolate target label and preserve the rest
+
+        # Create a boolean mask of ONLY the target label
         is_target = img == target_label
+
+        # Create a mask of everything that is not target label
         is_not_target = sitk.Cast(img != target_label, img.GetPixelID())
         other_labels = img * is_not_target
 
         # CLEAN
         print(f"Removing disconnected components for label {target_label}...")
-        connected_components = sitk.ConnectedComponent(is_target)
+
+        # Snap thin bridges by applying Morphological Opening (radius of 1 voxel)
+        # This will erode the image by 1 voxel, then dilate it by 1 voxel.
+        opened_target = sitk.BinaryMorphologicalOpening(is_target, (1, 1, 1))
+
+        # Run the component analysis on the opened target, with strict face-connectivity
+        connected_components = sitk.ConnectedComponent(opened_target, fullyConnected=False)
+
+        # Sort and keep the largest component
         sorted_components = sitk.RelabelComponent(connected_components)
         largest_component = sorted_components == 1
+
+        # Cast back to original type and label
         cleaned_target = sitk.Cast(largest_component, img.GetPixelID()) * target_label
 
         # RECOMBINE
