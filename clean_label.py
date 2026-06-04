@@ -36,7 +36,7 @@ def clean_specific_label(input_path, output_path, target_label):
         opened_target = sitk.BinaryMorphologicalOpening(is_target, (1, 1, 1))
 
         # Run the component analysis on the opened target, with strict face-connectivity
-        connected_components = sitk.ConnectedComponent(opened_target, fullyConnected=False)
+        connected_components = sitk.ConnectedComponent(opened_target, False)
 
         # Sort and keep the largest component
         sorted_components = sitk.RelabelComponent(connected_components)
