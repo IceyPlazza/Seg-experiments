@@ -31,8 +31,8 @@ def clean_specific_label(input_path, output_path, target_label):
         # CLEAN
         print(f"Removing disconnected components for label {target_label}...")
 
-        # Snap thin bridges by applying Morphological Opening (radius of 1 voxel)
-        # This will erode the image by 1 voxel, then dilate it by 1 voxel.
+        # Snap thin bridges by applying Morphological Opening (radius of 2 voxels)
+        # This will erode the image by 2 voxel, then dilate it by 2 voxels.
         opened_target = sitk.BinaryMorphologicalOpening(is_target, (1, 1, 1))
 
         # Run the component analysis on the opened target, with strict face-connectivity
