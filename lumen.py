@@ -4,9 +4,136 @@ import numpy as np
 import sys
 import os
 
+def initial_tissue_mask(img, upper_thresh, gen_file):
 
-def auto_segment_lumen(input_path, output_path, upper_thresh, shave_global, shave_top_val,
-                       shave_bottom_val, target_label=1):
+    print("Generating initial solid tissue mask...")
+    solid_mask = img > upper_thresh
+    solid_components = sitk.ConnectedComponent(solid_mask)
+    largest_solid = sitk.RelabelComponent(solid_components) == 1
+
+    if gen_file:
+        print("Generating step1_initial_tissue_body.nii.gz...")
+        sitk.WriteImage(sitk.Cast(largest_solid, sitk.sitkUInt8),
+                        "step1_initial_tissue_body.nii.gz")
+
+    return sitk.GetArrayFromImage(largest_solid)
+
+def extract_middle(solid_array):
+
+    print("Extracting the middle Z-slice as the clean reference blueprint...")
+    mid_z = solid_array.shape[0] // 2
+    reference_slice = solid_array[mid_z, :, :]
+
+    valid_y, valid_x = np.where(reference_slice)
+    if len(valid_y) == 0 or len(valid_x) == 0:
+        print("Error: No solid phantom tissue detected on the middle slice.")
+        sys.exit(1)
+
+    min_x, max_x = np.min(valid_x), np.max(valid_x)
+    min_y, max_y = np.min(valid_y), np.max(valid_y)
+
+    return min_x, max_x, min_y, max_y, reference_slice
+
+def calc_crop(min_x, max_x, min_y, max_y, reference_slice):
+
+    print("Calculating boundaries using the 4-sided 95% tissue rule...")
+    crop_bottom = int(max_y)
+    for y in range(max_y, min_y - 1, -1):
+        row_segment = reference_slice[y, min_x:max_x + 1]
+        tissue_ratio = np.sum(row_segment) / len(row_segment)
+        if tissue_ratio > 0.98:
+            crop_bottom = int(y)
+            break
+
+    crop_top = int(min_y)
+    for y in range(min_y, crop_bottom + 1):
+        row_segment = reference_slice[y, min_x:max_x + 1]
+        tissue_ratio = np.sum(row_segment) / len(row_segment)
+        if tissue_ratio > 0.905:
+            crop_top = int(y)
+            break
+
+    crop_left = int(min_x)
+    for x in range(min_x, max_x + 1):
+        column_segment = reference_slice[crop_top:crop_bottom + 1, x]
+        tissue_ratio = np.sum(column_segment) / len(column_segment)
+        if tissue_ratio > 0.95:
+            crop_left = int(x)
+            break
+
+    crop_right = int(max_x)
+    for x in range(max_x, min_x - 1, -1):
+        column_segment = reference_slice[crop_top:crop_bottom + 1, x]
+        tissue_ratio = np.sum(column_segment) / len(column_segment)
+        if tissue_ratio > 0.95:
+            crop_right = int(x)
+            break
+
+    return crop_top, crop_bottom, crop_left, crop_right
+
+def perform_crop(img, img_array, crop_top, crop_bottom, crop_left, crop_right, gen_file):
+    print(f"Executing 3D Crop: X({crop_left} to {crop_right}), Y({crop_top} to {crop_bottom})")
+    cropped_array = img_array[:, crop_top:crop_bottom + 1, crop_left:crop_right + 1]
+
+    cropped_img = sitk.GetImageFromArray(cropped_array)
+    cropped_img.SetSpacing(img.GetSpacing())
+    cropped_img.SetDirection(img.GetDirection())
+    cropped_img.SetOrigin(img.TransformIndexToPhysicalPoint([crop_left, crop_top, 0]))
+
+    if gen_file:
+        print("Generating step2_cropped_raw_image.nii.gz...")
+        sitk.WriteImage(cropped_img, "step2_cropped_raw_image.nii.gz")
+
+    return cropped_img
+
+def segment_air(cropped_img, upper_thresh, gen_file):
+    print("Segmenting trapped air within the cropped boundaries...")
+    cropped_tissue_mask = cropped_img > upper_thresh
+    padded_tissue = sitk.ConstantPad(cropped_tissue_mask, [1, 1, 1], [1, 1, 1], 1)
+
+    filled_tissue = sitk.BinaryFillhole(padded_tissue)
+    sealed_shell = sitk.Crop(filled_tissue, [1, 1, 1], [1, 1, 1])
+
+    air_mask = cropped_img <= upper_thresh
+    internal_air = air_mask * sealed_shell
+
+    if gen_file:
+        print("Generating step3_cropped_all_internal_air.nii.gz...")
+        sitk.WriteImage(sitk.Cast(internal_air, sitk.sitkUInt8),
+                        "step3_cropped_all_internal_air.nii.gz")
+
+    return internal_air
+
+def shave_faces(internal_air, shave_global, shave_top, shave_bottom, gen_file):
+    # --- RESOLVE SHAVE PARAMETERS FOR EACH FACE [X, Y, Z] ---
+    # Use specific overrides if provided, otherwise fall back to global shave value
+    z_shave_bottom = shave_bottom if shave_bottom is not None else shave_global
+    z_shave_top = shave_top if shave_top is not None else shave_global
+
+    lower_shave_bounds = [shave_global, shave_global, z_shave_bottom]
+    upper_shave_bounds = [shave_global, shave_global, z_shave_top]
+
+    print(f"Applying Boundary Erosion -> "
+          f"Lower Bounds [X,Y,Z]: {lower_shave_bounds}, Upper Bounds [X,Y,Z]: {upper_shave_bounds}")
+    shaved_air = sitk.Crop(internal_air, lower_shave_bounds, upper_shave_bounds)
+
+    # Pad back precisely what was shaved using the asymmetric maps to maintain matrix dimensions
+    disconnected_air = sitk.ConstantPad(shaved_air, lower_shave_bounds, upper_shave_bounds, 0)
+    print("Filtering disconnected components...")
+    cc_filter = sitk.ConnectedComponentImageFilter()
+    cc_filter.SetFullyConnected(False)
+    air_components = cc_filter.Execute(disconnected_air)
+    largest_lumen = sitk.RelabelComponent(air_components) == 1
+
+    if gen_file:
+        print("Generating step4_cropped_isolated_lumen.nii.gz...")
+        sitk.WriteImage(sitk.Cast(largest_lumen, sitk.sitkUInt8),
+                        "step4_cropped_isolated_lumen.nii.gz")
+
+    return largest_lumen
+
+def auto_segment_lumen(input_path, output_path, upper_thresh, shave_global, shave_top,
+                       shave_bottom, gen_file, target_label):
     if not os.path.exists(input_path):
         print(f"Error: The input scan '{input_path}' was not found.")
         sys.exit(1)
@@ -17,108 +144,22 @@ def auto_segment_lumen(input_path, output_path, upper_thresh, shave_global, shav
         img_array = sitk.GetArrayFromImage(img)
 
         # --- STEP 1: INITIAL TISSUE MASK ---
-        print("Generating initial solid tissue mask...")
-        solid_mask = img > upper_thresh
-        solid_components = sitk.ConnectedComponent(solid_mask)
-        largest_solid = sitk.RelabelComponent(solid_components) == 1
-
-        sitk.WriteImage(sitk.Cast(largest_solid, sitk.sitkUInt8), "step1_initial_solid_body.nii.gz")
-        solid_array = sitk.GetArrayFromImage(largest_solid)
+        solid_array = initial_tissue_mask(img, upper_thresh, gen_file)
 
         # --- STEP 2: THE "GOLDEN SLICE" REFERENCE ---
-        print("Extracting the middle Z-slice as the clean reference blueprint...")
-        mid_z = solid_array.shape[0] // 2
-        reference_slice = solid_array[mid_z, :, :]
-
-        valid_y, valid_x = np.where(reference_slice)
-        if len(valid_y) == 0 or len(valid_x) == 0:
-            print("Error: No solid phantom tissue detected on the middle slice.")
-            sys.exit(1)
-
-        min_y, max_y = np.min(valid_y), np.max(valid_y)
-        min_x, max_x = np.min(valid_x), np.max(valid_x)
+        min_x, max_x, min_y, max_y, reference_slice = extract_middle(solid_array)
 
         # --- STEP 3: CALCULATE 4-WAY CROP LINES ---
-        print("Calculating boundaries using the 4-sided 95% tissue rule...")
-        crop_bottom = int(max_y)
-        for y in range(max_y, min_y - 1, -1):
-            row_segment = reference_slice[y, min_x:max_x + 1]
-            tissue_ratio = np.sum(row_segment) / len(row_segment)
-            if tissue_ratio > 0.95:
-                crop_bottom = int(y)
-                break
-
-        crop_top = int(min_y)
-        for y in range(min_y, crop_bottom + 1):
-            row_segment = reference_slice[y, min_x:max_x + 1]
-            tissue_ratio = np.sum(row_segment) / len(row_segment)
-            if tissue_ratio > 0.905:
-                crop_top = int(y)
-                break
-
-        crop_left = int(min_x)
-        for x in range(min_x, max_x + 1):
-            column_segment = reference_slice[crop_top:crop_bottom + 1, x]
-            tissue_ratio = np.sum(column_segment) / len(column_segment)
-            if tissue_ratio > 0.95:
-                crop_left = int(x)
-                break
-
-        crop_right = int(max_x)
-        for x in range(max_x, min_x - 1, -1):
-            column_segment = reference_slice[crop_top:crop_bottom + 1, x]
-            tissue_ratio = np.sum(column_segment) / len(column_segment)
-            if tissue_ratio > 0.95:
-                crop_right = int(x)
-                break
+        crop_top, crop_bottom, crop_left, crop_right = (
+            calc_crop(min_x, max_x, min_y, max_y, reference_slice))
 
         # --- STEP 4: EXECUTE THE 3D CROP ---
-        print(f"Executing 3D Crop: X({crop_left} to {crop_right}), Y({crop_top} to {crop_bottom})")
-        cropped_array = img_array[:, crop_top:crop_bottom + 1, crop_left:crop_right + 1]
-
-        cropped_img = sitk.GetImageFromArray(cropped_array)
-        cropped_img.SetSpacing(img.GetSpacing())
-        cropped_img.SetDirection(img.GetDirection())
-        cropped_img.SetOrigin(img.TransformIndexToPhysicalPoint([crop_left, crop_top, 0]))
-
-        sitk.WriteImage(cropped_img, "step2_cropped_raw_image.nii.gz")
+        cropped_img = perform_crop(img, img_array, crop_top, crop_bottom, crop_left, crop_right,
+                                   gen_file)
 
         # --- STEP 5: SEGMENT AND ASYMMETRICALLY SHAVE ---
-        print("Segmenting trapped air within the cropped boundaries...")
-        cropped_tissue_mask = cropped_img > upper_thresh
-        padded_tissue = sitk.ConstantPad(cropped_tissue_mask, [1, 1, 1], [1, 1, 1], 1)
-
-        filled_tissue = sitk.BinaryFillhole(padded_tissue)
-        sealed_shell = sitk.Crop(filled_tissue, [1, 1, 1], [1, 1, 1])
-
-        air_mask = cropped_img <= upper_thresh
-        internal_air = air_mask * sealed_shell
-        sitk.WriteImage(sitk.Cast(internal_air, sitk.sitkUInt8),
-                        "step3_all_internal_air_cropped.nii.gz")
-
-        # --- RESOLVE SHAVE PARAMETERS FOR EACH FACE [X, Y, Z] ---
-        # Use specific overrides if provided, otherwise fall back to global shave value
-        z_shave_bottom = shave_bottom_val if shave_bottom_val is not None else shave_global
-        z_shave_top = shave_top_val if shave_top_val is not None else shave_global
-
-        lower_shave_bounds = [shave_global, shave_global, z_shave_bottom]
-        upper_shave_bounds = [shave_global, shave_global, z_shave_top]
-
-        print(
-            f"Applying Boundary Erosion -> Lower Bounds [X,Y,Z]: {lower_shave_bounds}, Upper Bounds [X,Y,Z]: {upper_shave_bounds}")
-        shaved_air = sitk.Crop(internal_air, lower_shave_bounds, upper_shave_bounds)
-
-        # Pad back precisely what was shaved using the asymmetric maps to maintain matrix dimensions
-        disconnected_air = sitk.ConstantPad(shaved_air, lower_shave_bounds, upper_shave_bounds, 0)
-
-        print("Filtering disconnected components...")
-        cc_filter = sitk.ConnectedComponentImageFilter()
-        cc_filter.SetFullyConnected(False)
-        air_components = cc_filter.Execute(disconnected_air)
-        largest_lumen = sitk.RelabelComponent(air_components) == 1
-
-        sitk.WriteImage(sitk.Cast(largest_lumen, sitk.sitkUInt8),
-                        "step4_isolated_lumen_cropped.nii.gz")
+        internal_air = segment_air(cropped_img, upper_thresh, gen_file)
+        largest_lumen = shave_faces(internal_air, shave_global, shave_top, shave_bottom, gen_file)
 
         # --- STEP 6: PASTE BACK TO ORIGINAL DIMENSIONS ---
         print("Realigning mask with original dimensions...")
@@ -145,25 +186,40 @@ def auto_segment_lumen(input_path, output_path, upper_thresh, shave_global, shav
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Adaptive Guillotine Segmentation with Custom Asymmetric Face Shaving.")
-    parser.add_argument("-i", "--input", required=True, help="Path to raw scan")
-    parser.add_argument("-o", "--output", required=True, help="Path to save final mask")
-    parser.add_argument("-u", "--upper_thresh", type=float, default=-500.0,
-                        help="Upper intensity limit")
+        description="Adaptive BPH Lumen Segmentation.")
 
-    # Base/Global shave parameter
+    # Required input output paths
+    parser.add_argument("-i", "--input", required=True,
+                        help="Path to raw scan")
+    parser.add_argument("-o", "--output", required=True,
+                        help="Path to save final mask")
+
+    # Generate intermediate files (for debugging)
+    parser.add_argument("-g", "--generate_files", type=bool, default=False,
+                        help = "Bool; Generates intermediate files (for debugging)")
+
+    parser.add_argument("-l", "--label", type=int, default=1,
+                        help="Int; Label number to work on")
+
+    # Adjust upper threshold
+    parser.add_argument("-u", "--upper_thresh", type=float, default=-500.0,
+                        help="Float; Upper threshold limit")
+
+    # Global shave parameter
     parser.add_argument("-s", "--shave", type=int, default=2,
-                        help="Global number of boundary voxels to shave off all 6 faces (default: 2)")
+                        help="Int; Global number of voxels to shave off all 6 faces (default: 2)")
 
     # Specialized face overrides
     parser.add_argument("-st", "--shave_top", type=int, default=None,
-                        help="Specific number of voxels to shave from the top face (Z-upper). Overrides global -s.")
+                        help="Int; Specific number of voxels to shave from the top face (Z-upper)."
+                             " Overrides global -s.")
     parser.add_argument("-sb", "--shave_bottom", type=int, default=None,
-                        help="Specific number of voxels to shave from the bottom face (Z-lower). Overrides global -s.")
+                        help="Int; Specific number of voxels to shave from the bottom face "
+                             "(Z-lower). Overrides global -s.")
 
     args = parser.parse_args()
     auto_segment_lumen(args.input, args.output, args.upper_thresh, args.shave, args.shave_top,
-                       args.shave_bottom)
+                       args.shave_bottom, args.generate_files, args.label)
 
 
 if __name__ == "__main__":
