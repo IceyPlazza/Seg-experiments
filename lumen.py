@@ -34,14 +34,14 @@ def extract_middle(solid_array):
 
     return min_x, max_x, min_y, max_y, reference_slice
 
-def calc_crop(min_x, max_x, min_y, max_y, reference_slice):
+def calc_crop(min_x, max_x, min_y, max_y, reference_slice, tissue_to_air):
 
-    print("Calculating boundaries using the 4-sided 95% tissue rule...")
+    print(f"Calculating boundaries using the 4-sided {tissue_to_air} tissue rule...")
     crop_bottom = int(max_y)
     for y in range(max_y, min_y - 1, -1):
         row_segment = reference_slice[y, min_x:max_x + 1]
         tissue_ratio = np.sum(row_segment) / len(row_segment)
-        if tissue_ratio > 0.98:
+        if tissue_ratio > tissue_to_air + 0.03:
             crop_bottom = int(y)
             break
 
@@ -49,7 +49,7 @@ def calc_crop(min_x, max_x, min_y, max_y, reference_slice):
     for y in range(min_y, crop_bottom + 1):
         row_segment = reference_slice[y, min_x:max_x + 1]
         tissue_ratio = np.sum(row_segment) / len(row_segment)
-        if tissue_ratio > 0.905:
+        if tissue_ratio > tissue_to_air - 0.045:
             crop_top = int(y)
             break
 
@@ -57,7 +57,7 @@ def calc_crop(min_x, max_x, min_y, max_y, reference_slice):
     for x in range(min_x, max_x + 1):
         column_segment = reference_slice[crop_top:crop_bottom + 1, x]
         tissue_ratio = np.sum(column_segment) / len(column_segment)
-        if tissue_ratio > 0.95:
+        if tissue_ratio > tissue_to_air:
             crop_left = int(x)
             break
 
@@ -65,7 +65,7 @@ def calc_crop(min_x, max_x, min_y, max_y, reference_slice):
     for x in range(max_x, min_x - 1, -1):
         column_segment = reference_slice[crop_top:crop_bottom + 1, x]
         tissue_ratio = np.sum(column_segment) / len(column_segment)
-        if tissue_ratio > 0.95:
+        if tissue_ratio > tissue_to_air:
             crop_right = int(x)
             break
 
@@ -133,7 +133,7 @@ def shave_faces(internal_air, shave_global, shave_top, shave_bottom, gen_file):
     return largest_lumen
 
 def auto_segment_lumen(input_path, output_path, upper_thresh, shave_global, shave_top,
-                       shave_bottom, gen_file, target_label):
+                       shave_bottom, gen_file, target_label, tissue_to_air):
     if not os.path.exists(input_path):
         print(f"Error: The input scan '{input_path}' was not found.")
         sys.exit(1)
@@ -151,7 +151,7 @@ def auto_segment_lumen(input_path, output_path, upper_thresh, shave_global, shav
 
         # --- STEP 3: CALCULATE 4-WAY CROP LINES ---
         crop_top, crop_bottom, crop_left, crop_right = (
-            calc_crop(min_x, max_x, min_y, max_y, reference_slice))
+            calc_crop(min_x, max_x, min_y, max_y, reference_slice, tissue_to_air))
 
         # --- STEP 4: EXECUTE THE 3D CROP ---
         cropped_img = perform_crop(img, img_array, crop_top, crop_bottom, crop_left, crop_right,
@@ -190,36 +190,41 @@ def main():
 
     # Required input output paths
     parser.add_argument("-i", "--input", required=True,
-                        help="Path to raw scan")
+                        help="Path to raw scan (REQUIRED)")
     parser.add_argument("-o", "--output", required=True,
-                        help="Path to save final mask")
+                        help="Path to save final mask (REQUIRED)")
 
-    # Generate intermediate files (for debugging)
-    parser.add_argument("-g", "--generate_files", type=bool, default=False,
-                        help = "Bool; Generates intermediate files (for debugging)")
-
-    parser.add_argument("-l", "--label", type=int, default=1,
-                        help="Int; Label number to work on")
+    # Which label to apply mask to
+    parser.add_argument("-l", "--label", type=int, default=2,
+                        help="Int; Label number to work on (default: 2)")
 
     # Adjust upper threshold
     parser.add_argument("-u", "--upper_thresh", type=float, default=-500.0,
-                        help="Float; Upper threshold limit")
+                        help="Float; Upper threshold limit (default: -500)")
+
+    # Tissue-to-air ratio requirement
+    parser.add_argument("-t", "--tissue_to_air", type=float, default=0.95,
+                        help="Float; Tissue-to-air ratio limit (default: 0.95)")
 
     # Global shave parameter
-    parser.add_argument("-s", "--shave", type=int, default=2,
+    parser.add_argument("-s", "--shave", type=int, default=4,
                         help="Int; Global number of voxels to shave off all 6 faces (default: 2)")
 
     # Specialized face overrides
-    parser.add_argument("-st", "--shave_top", type=int, default=None,
+    parser.add_argument("-st", "--shave_top", type=int, default=10,
                         help="Int; Specific number of voxels to shave from the top face (Z-upper)."
-                             " Overrides global -s.")
-    parser.add_argument("-sb", "--shave_bottom", type=int, default=None,
+                             " Overrides global -s (default: 10)")
+    parser.add_argument("-sb", "--shave_bottom", type=int, default=15,
                         help="Int; Specific number of voxels to shave from the bottom face "
-                             "(Z-lower). Overrides global -s.")
+                             "(Z-lower). Overrides global -s (default: 15)")
+
+    # Generate intermediate files (for debugging)
+    parser.add_argument("-g", "--generate_files", action="store_true",
+                        help="Including this flag generates intermediate files (for debugging)")
 
     args = parser.parse_args()
     auto_segment_lumen(args.input, args.output, args.upper_thresh, args.shave, args.shave_top,
-                       args.shave_bottom, args.generate_files, args.label)
+                       args.shave_bottom, args.generate_files, args.label, args.tissue_to_air)
 
 
 if __name__ == "__main__":
