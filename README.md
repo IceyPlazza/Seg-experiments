@@ -31,13 +31,13 @@ structural geometry (circularity and extent).
 #### Basic Command
 
 ```bash
-python lumen.py -i /path/to/raw/scan.nii.gz -o /path/to/output/lumen_mask.nii.gz
+python lumen.py -i /path/to/raw/scan.nii.gz
 ```
 
-#### Advanced Command with Debugging
+#### Generating Debugging Files (To see intermediate steps)
 
 ```bash
-python lumen.py -i /path/to/scan.nii.gz -o /path/to/output.nii.gz -g
+python lumen.py -i /path/to/scan.nii.gz -g
 ```
 
 ### `lumen.py` Configuration Flags
@@ -55,8 +55,8 @@ Use `python lumen.py -h` in the terminal for a quick reference.
 from the top down (Default: `0.5`).
 - `-sb` / `--shave_bottom`: Target extent score (0.0 to 1.0) to stop dynamically shaving slices from
 the bottom up (Default: `0.4`).
-- `-sa` / `--shave_anterior`: Target circularity score (0.0 to 1.0) to stop dynamically shaving 
-coronal slices inward from the anterior face (Default: `0.3`).
+- `-sa` / `--shave_anterior`: Target extent score (0.0 to 1.0) to stop dynamically shaving 
+coronal slices inward from the anterior face (Default: `0.2`).
 - `-sl` / `--shave_limit`: The maximum number of slices the script is allowed to dynamically shave 
 before capping out (Default: `35`).
 - `-g` / `--generate_files`: Include this flag to output intermediate steps 
@@ -65,7 +65,6 @@ before capping out (Default: `35`).
 ## Troubleshooting
 
 If your final lumen mask isn't looking quite right, try adjusting the corresponding flags:
-
 
 | Symptom                                                 | Solution                                                                                                            | Flag to Adjust                                  |
 |---------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------|-------------------------------------------------|

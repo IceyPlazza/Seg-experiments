@@ -5,14 +5,14 @@ import sys
 import os
 import math
 
-def initial_tissue_mask(img, upper_thresh, gen_file):
+def initial_tissue_mask(img, upper_thresh, debug_dir):
     """
     Generates a binary mask of the largest solid tissue component in the image.
 
     Args:
         img (SimpleITK.Image): The original 3D image scan.
         upper_thresh (float): The threshold value to separate solid tissue from air.
-        gen_file (bool): Flag to generate a debug NIfTI file of the mask.
+        debug_dir (str or None): Path to the debug directory. If None, debug files are skipped.
 
     Returns:
         numpy.ndarray: A 3D numpy array representing the largest solid tissue mask.
@@ -22,10 +22,10 @@ def initial_tissue_mask(img, upper_thresh, gen_file):
     solid_components = sitk.ConnectedComponent(solid_mask)
     largest_solid = sitk.RelabelComponent(solid_components) == 1
 
-    if gen_file:
-        print("  [DEBUG] Generating step1_initial_tissue_body.nii.gz...")
-        sitk.WriteImage(sitk.Cast(largest_solid, sitk.sitkUInt8),
-                        "step1_initial_tissue_body.nii.gz")
+    if debug_dir:
+        debug_path = os.path.join(debug_dir, "step1_initial_tissue_body.nii.gz")
+        print(f"  [DEBUG] Generating {debug_path}...")
+        sitk.WriteImage(sitk.Cast(largest_solid, sitk.sitkUInt8), debug_path)
 
     return sitk.GetArrayFromImage(largest_solid)
 
@@ -104,7 +104,7 @@ def calc_crop(min_x, max_x, min_y, max_y, reference_slice, tissue_to_air):
 
     return crop_top, crop_bottom, crop_left, crop_right
 
-def perform_crop(img, img_array, crop_top, crop_bottom, crop_left, crop_right, gen_file):
+def perform_crop(img, img_array, crop_top, crop_bottom, crop_left, crop_right, debug_dir):
     """
     Crops the original 3D image using the computed 2D boundaries.
 
@@ -115,7 +115,7 @@ def perform_crop(img, img_array, crop_top, crop_bottom, crop_left, crop_right, g
         crop_bottom (int): Bottom boundary (Y-axis).
         crop_left (int): Left boundary (X-axis).
         crop_right (int): Right boundary (X-axis).
-        gen_file (bool): Flag to generate a debug NIfTI file.
+        debug_dir (str or None): Path to the debug directory. If None, debug files are skipped.
 
     Returns:
         SimpleITK.Image: The cropped 3D image with preserved spatial metadata.
@@ -129,20 +129,21 @@ def perform_crop(img, img_array, crop_top, crop_bottom, crop_left, crop_right, g
     cropped_img.SetDirection(img.GetDirection())
     cropped_img.SetOrigin(img.TransformIndexToPhysicalPoint([crop_left, crop_top, 0]))
 
-    if gen_file:
-        print("  [DEBUG] Generating step4_cropped_raw_image.nii.gz...")
-        sitk.WriteImage(cropped_img, "step4_cropped_raw_image.nii.gz")
+    if debug_dir:
+        debug_path = os.path.join(debug_dir, "step4_cropped_raw_image.nii.gz")
+        print(f"  [DEBUG] Generating {debug_path}...")
+        sitk.WriteImage(cropped_img, debug_path)
 
     return cropped_img
 
-def segment_air(cropped_img, upper_thresh, gen_file):
+def segment_air(cropped_img, upper_thresh, debug_dir):
     """
     Isolates trapped internal air pockets within the cropped tissue volume.
 
     Args:
         cropped_img (SimpleITK.Image): The cropped 3D image.
         upper_thresh (float): Threshold to differentiate air from tissue.
-        gen_file (bool): Flag to generate a debug NIfTI file.
+        debug_dir (str or None): Path to the debug directory. If None, debug files are skipped.
 
     Returns:
         SimpleITK.Image: A 3D binary mask of the internal air.
@@ -157,10 +158,10 @@ def segment_air(cropped_img, upper_thresh, gen_file):
     air_mask = cropped_img <= upper_thresh
     internal_air = air_mask * sealed_shell
 
-    if gen_file:
-        print("  [DEBUG] Generating step5_cropped_all_internal_air.nii.gz...")
-        sitk.WriteImage(sitk.Cast(internal_air, sitk.sitkUInt8),
-                        "step5_cropped_all_internal_air.nii.gz")
+    if debug_dir:
+        debug_path = os.path.join(debug_dir, "step5_cropped_all_internal_air.nii.gz")
+        print(f"  [DEBUG] Generating {debug_path}...")
+        sitk.WriteImage(sitk.Cast(internal_air, sitk.sitkUInt8), debug_path)
 
     return internal_air
 
@@ -302,7 +303,7 @@ def calc_bottom_shave(internal_air, target_extent, shave_limit):
 
     return shave_count
 
-def calc_anterior_shave(internal_air, target_circularity, shave_limit):
+def calc_anterior_shave(internal_air, target_extent, shave_limit):
     """
     Analyzes anterior coronal slices inward to calculate anterior face shaving based on circularity.
 
@@ -314,8 +315,8 @@ def calc_anterior_shave(internal_air, target_circularity, shave_limit):
     Returns:
         int: The number of slices to shave from the anterior face (Y-axis).
     """
-    print(f"[INFO] Analyzing Anterior (-Y) slices for semi-circular shape "
-          f"(Target >= {target_circularity})...")
+    print(f"[INFO] Analyzing Anterior (-Y) slices for semi-elliptical shape "
+          f"(Target >= {target_extent})...")
     image_width = internal_air.GetWidth()
     image_height = internal_air.GetHeight()
     image_depth = internal_air.GetDepth()
@@ -343,20 +344,26 @@ def calc_anterior_shave(internal_air, target_circularity, shave_limit):
             shave_count += 1
             continue
 
-        area = shape_stats.GetPhysicalSize(1)
-        perimeter = shape_stats.GetPerimeter(1)
+        if bbox_h > 0:
+            aspect_ratio = bbox_w / bbox_h
+            if aspect_ratio > 4.0:
+                shave_count += 1
+                continue
 
-        if perimeter == 0:
+        area_pixels = shape_stats.GetNumberOfPixels(1)
+        bbox_area = bbox_w * bbox_h
+
+        if bbox_area == 0:
             shave_count += 1
             continue
 
-        circularity = (4 * math.pi * area) / (perimeter ** 2)
+        extent = area_pixels / bbox_area
 
-        if circularity < target_circularity:
+        if extent < target_extent:
             shave_count += 1
         else:
             print(f"  -> [SUCCESS] Found valid semi-circular lumen at Y-depth {shave_count} "
-                  f"(Circularity: {circularity:.2f})")
+                  f"(Extent: {extent:.2f})")
             break
 
     if shave_count == image_height:
@@ -369,7 +376,7 @@ def calc_anterior_shave(internal_air, target_circularity, shave_limit):
     return shave_count
 
 def shave_faces(internal_air, shave_global, dynamic_shave_top, dynamic_shave_bottom,
-                dynamic_shave_anterior, gen_file):
+                dynamic_shave_anterior, debug_dir):
     """
     Applies calculated asymmetric crop bounds to the air mask and isolates the largest component.
 
@@ -379,7 +386,7 @@ def shave_faces(internal_air, shave_global, dynamic_shave_top, dynamic_shave_bot
         dynamic_shave_top (int): Calculated shave depth for the top face.
         dynamic_shave_bottom (int): Calculated shave depth for the bottom face.
         dynamic_shave_anterior (int): Calculated shave depth for the anterior face.
-        gen_file (bool): Flag to generate a debug NIfTI file.
+        debug_dir (str or None): Path to the debug directory. If None, debug files are skipped.
 
     Returns:
         SimpleITK.Image: A 3D mask containing the final, isolated continuous lumen.
@@ -416,14 +423,14 @@ def shave_faces(internal_air, shave_global, dynamic_shave_top, dynamic_shave_bot
     air_components = cc_filter.Execute(disconnected_air)
     largest_lumen = sitk.RelabelComponent(air_components) == 1
 
-    if gen_file:
-        print("  [DEBUG] Generating step6_cropped_isolated_lumen.nii.gz...")
-        sitk.WriteImage(sitk.Cast(largest_lumen, sitk.sitkUInt8),
-                        "step6_cropped_isolated_lumen.nii.gz")
+    if debug_dir:
+        debug_path = os.path.join(debug_dir, "step6_cropped_isolated_lumen.nii.gz")
+        print(f"  [DEBUG] Generating {debug_path}...")
+        sitk.WriteImage(sitk.Cast(largest_lumen, sitk.sitkUInt8), debug_path)
 
     return largest_lumen
 
-def auto_segment_lumen(input_path, output_path, upper_thresh, shave_global, target_top,
+def auto_segment_lumen(input_path, upper_thresh, shave_global, target_top,
                        target_bottom, target_anterior, shave_limit, gen_file, target_label,
                        tissue_to_air):
     """
@@ -442,9 +449,31 @@ def auto_segment_lumen(input_path, output_path, upper_thresh, shave_global, targ
         target_label (int): Integer label written to the final output mask.
         tissue_to_air (float): Density ratio rule for cropping operations.
     """
+
+    input_path = os.path.abspath(input_path)
+
     if not os.path.exists(input_path):
         print(f"\n[ERROR] The input scan '{input_path}' was not found.")
         sys.exit(1)
+
+    input_dir = os.path.dirname(input_path)
+    base_filename = os.path.basename(input_path)
+    if base_filename.endswith('_0000.nii.gz'):
+        clean_name = base_filename[:-12]
+    elif base_filename.endswith('.nii.gz'):
+        clean_name = base_filename[:-7]
+    elif base_filename.endswith('.nii'):
+        clean_name = base_filename[:-4]
+    else:
+        clean_name = os.path.splitext(base_filename)[0]
+
+    output_path = os.path.join(input_dir, f"{clean_name}_lumen_mask.nii.gz")
+
+    debug_dir = None
+    if gen_file:
+        debug_dir = os.path.join(input_dir, f"{clean_name}_debug")
+        os.makedirs(debug_dir, exist_ok=True)
+        print(f"\n[INFO] Debug mode enabled. Intermediate files will be saved to: {debug_dir}")
 
     try:
         print(f"\n[INFO] Loading raw scan '{input_path}'...")
@@ -452,7 +481,7 @@ def auto_segment_lumen(input_path, output_path, upper_thresh, shave_global, targ
         img_array = sitk.GetArrayFromImage(img)
 
         print("\n=== STEP 1: INITIAL TISSUE MASK ===")
-        solid_array = initial_tissue_mask(img, upper_thresh, gen_file)
+        solid_array = initial_tissue_mask(img, upper_thresh, debug_dir)
 
         print("\n=== STEP 2: THE 'GOLDEN SLICE' REFERENCE ===")
         min_x, max_x, min_y, max_y, reference_slice = extract_middle(solid_array)
@@ -463,17 +492,17 @@ def auto_segment_lumen(input_path, output_path, upper_thresh, shave_global, targ
 
         print("\n=== STEP 4: EXECUTE THE 3D CROP ===")
         cropped_img = perform_crop(img, img_array, crop_top, crop_bottom, crop_left, crop_right,
-                                   gen_file)
+                                   debug_dir)
 
         print("\n=== STEP 5: SEGMENT INTERNAL AIR ===")
-        internal_air = segment_air(cropped_img, upper_thresh, gen_file)
+        internal_air = segment_air(cropped_img, upper_thresh, debug_dir)
 
         print("\n=== STEP 6: ASYMMETRICALLY SHAVE SIDES ===")
         dynamic_shave_top = calc_top_shave(internal_air, target_top, shave_limit)
         dynamic_shave_bottom = calc_bottom_shave(internal_air, target_bottom, shave_limit)
         dynamic_shave_anterior = calc_anterior_shave(internal_air, target_anterior, shave_limit)
         shaved_lumen = shave_faces(internal_air, shave_global, dynamic_shave_top,
-                                    dynamic_shave_bottom, dynamic_shave_anterior, gen_file)
+                                    dynamic_shave_bottom, dynamic_shave_anterior, debug_dir)
 
         print("\n=== STEP 7: PASTE BACK TO ORIGINAL DIMENSIONS ===")
         print("[INFO] Realigning mask with original dimensions...")
@@ -504,8 +533,6 @@ def main():
 
     parser.add_argument("-i", "--input", required=True,
                         help="Path to raw scan (REQUIRED)")
-    parser.add_argument("-o", "--output", required=True,
-                        help="Path to save final mask (REQUIRED)")
     parser.add_argument("-l", "--label", type=int, default=2,
                         help="Int; Label number to work on (default: 2)")
     parser.add_argument("-u", "--upper_thresh", type=float, default=-500.0,
@@ -519,10 +546,10 @@ def main():
                              "(default: 0.5)")
     parser.add_argument("-sb", "--shave_bottom", type=float, default=0.4,
                         help="Float; Target extent score to dynamically shave from bottom-up "
-                             "(default: 0.3)")
-    parser.add_argument("-sa", "--shave_anterior", type=float, default=0.3,
-                        help="Float; Target circularity score to dynamically shave from anterior "
-                             "(default: 0.3)")
+                             "(default: 0.4)")
+    parser.add_argument("-sa", "--shave_anterior", type=float, default=0.2,
+                        help="Float; Target extent score to dynamically shave from anterior "
+                             "(default: 0.2)")
     parser.add_argument("-sl", "--shave_limit", type=int, default=35,
                         help="Int; Voxel shave cap for dynamic top, bottom, and anterior "
                              "(default: 35)")
@@ -530,7 +557,7 @@ def main():
                         help="Including this flag generates intermediate files (for debugging)")
 
     args = parser.parse_args()
-    auto_segment_lumen(args.input, args.output, args.upper_thresh, args.shave, args.shave_top,
+    auto_segment_lumen(args.input, args.upper_thresh, args.shave, args.shave_top,
                        args.shave_bottom, args.shave_anterior, args.shave_limit,
                        args.generate_files, args.label, args.tissue_to_air)
 
