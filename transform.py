@@ -1,10 +1,11 @@
 import numpy as np
 import open3d as o3d
+import argparse
+import sys
 
 
 def align_and_generate_shell(file_paths, output_path, poisson_depth=8):
     """Micro-aligns multiple STL files using ICP, merges them,
-
     and uses Poisson surface reconstruction to create a tight, watertight shell.
     """
     if not file_paths:
@@ -25,8 +26,6 @@ def align_and_generate_shell(file_paths, output_path, poisson_depth=8):
 
     # 1. Surface-to-Surface Micro-Alignment (ICP)
     # -------------------------------------------------------------
-    # Max distance the algorithm looks for matching points (adjust based on your scale)
-    # For prostate meshes in millimeter scale, 2.0 to 5.0 mm is a good search radius
     threshold = 3.0
     trans_init = np.identity(4)  # Start with Slicer's baseline alignment
 
@@ -62,18 +61,14 @@ def align_and_generate_shell(file_paths, output_path, poisson_depth=8):
             radius=5.0, max_nn=30
         )
     )
-    # Ensure all normals point outward consistently
     combined_pcd.orient_normals_towards_camera_location(
         camera_location=np.array([0.0, 0.0, 0.0])
     )
-    # Invert if the camera calculation accidentally targets the interior center
     combined_pcd.normals = o3d.utility.Vector3dVector(
         -np.asarray(combined_pcd.normals)
     )
 
     print(f"--> Running Poisson Surface Reconstruction (Depth={poisson_depth})...")
-    # depth: Higher values (9-10) capture highly specific details but can fit to noise.
-    # A depth of 7-8 is ideal for a clean, tight, organic "capsule" boundary.
     shell_mesh, densities = (
         o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
             combined_pcd, depth=poisson_depth
@@ -86,11 +81,9 @@ def align_and_generate_shell(file_paths, output_path, poisson_depth=8):
     shell_mesh.remove_vertices_by_mask(vertices_to_remove)
 
     print("--> Applying Laplacian smoothing...")
-    # You can increase iterations (e.g., 10 to 30) for a smoother finish
     shell_mesh = shell_mesh.filter_smooth_laplacian(number_of_iterations=15)
-    shell_mesh.compute_vertex_normals()  # Recompute lighting for the smoothed shape
 
-    # 2. Compute lighting vectors so it isn't a black blob
+    # Compute lighting vectors so it isn't a black blob
     shell_mesh.compute_vertex_normals()
     # -----------------------------
 
@@ -105,14 +98,44 @@ def align_and_generate_shell(file_paths, output_path, poisson_depth=8):
     )
 
 
-# Example usage:
+# ==========================================
+# CLI Execution Block
+# ==========================================
 if __name__ == "__main__":
-    # Add your exported, hardened STL paths here
-    # Keep the best/most complete file as the first entry (Anchor)
-    my_stls = ["C:/Users/iven0/OneDrive/Desktop/VINE-Lab-Software/BPH_capsules/bph_model1_08_14_25_capsule.stl", "C:/Users/iven0/OneDrive/Desktop/VINE-Lab-Software/BPH_capsules/transformed_bph_model2_09_17_25.stl"]
-
-    align_and_generate_shell(
-        file_paths=my_stls,
-        output_path="prostate_capsule_shell_test.stl",
-        poisson_depth=8,  # Change to 7 for a smoother wrap, 9 for tighter details
+    parser = argparse.ArgumentParser(
+        description="Align multiple STL meshes and generate a continuous Poisson shell."
     )
+
+    # The nargs='+' turns all inputs after this flag into a list of strings
+    parser.add_argument(
+        "-i", "--inputs",
+        nargs='+',
+        required=True,
+        help="List of input STL files separated by spaces. The FIRST file acts as the anchor."
+    )
+
+    parser.add_argument(
+        "-o", "--output",
+        default="prostate_capsule_shell.stl",
+        help="Path for the output STL [Default: prostate_capsule_shell.stl]"
+    )
+
+    parser.add_argument(
+        "-d", "--depth",
+        type=int,
+        default=8,
+        help="Poisson reconstruction depth (e.g., 7 for smooth, 9 for detailed) [Default: 8]"
+    )
+
+    args = parser.parse_args()
+
+    try:
+        # Pass the parsed arguments into your existing function
+        align_and_generate_shell(
+            file_paths=args.inputs,
+            output_path=args.output,
+            poisson_depth=args.depth
+        )
+    except Exception as e:
+        print(f"\n[ERROR] Pipeline failed: {e}", file=sys.stderr)
+        sys.exit(1)
