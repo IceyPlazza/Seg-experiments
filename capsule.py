@@ -16,11 +16,12 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(name)s %(levelname
 logger = logging.getLogger(__name__)
 
 
-def isolate_capsule(img, lower_thresh, lumen_img, save_debug):
-    """
-    Segments the prostate capsule using a Two-Pass 'Pre-Targeted Healing' architecture,
-    followed by a 'Centroid Lock' targeting algorithm. Heavily optimized for RAM.
-    """
+# =====================================================================
+# PIPELINE STAGE 1: CORE ALGORITHM METHODS
+# =====================================================================
+
+def step1_raw_exclusion(img, lower_thresh, lumen_img, save_debug):
+    """Applies initial threshold and carves out the lumen exclusion zone."""
     logger.info("--- STEP 1: Raw Thresholding & Exclusion ---")
     logger.info(f"Applying lower-bound threshold (>= {lower_thresh})...")
     binary_mask = img >= lower_thresh
@@ -30,79 +31,104 @@ def isolate_capsule(img, lower_thresh, lumen_img, save_debug):
     logger.info("Applying Lumen exclusion mask to prevent territory overlap...")
     lumen_binary = sitk.Cast(lumen_img > 0, sitk.sitkUInt8)
     safe_zone = sitk.Cast(lumen_img == 0, sitk.sitkUInt8)
+
+    # Exclude lumen territory
     binary_mask = binary_mask * safe_zone
 
+    return binary_mask, lumen_binary, safe_zone
+
+
+def step2_pre_filter_dust(binary_mask, save_debug):
+    """Isolates the largest structures to delete microscopic background dust."""
     logger.info("--- STEP 2: Pre-Filtering (The Dust Sweep) ---")
     logger.info("Filtering background dust before applying morphological cement...")
     cc_filter = sitk.ConnectedComponentImageFilter()
     cc_filter.SetFullyConnected(False)
 
     raw_components = cc_filter.Execute(binary_mask)
-    del binary_mask  # [RAM CLEAR]
 
     # Sort by size and isolate ONLY the Top 5 largest structures
     raw_relabeled = sitk.RelabelComponent(raw_components)
-    del raw_components  # [RAM CLEAR]
+    del raw_components  # RAM flush
 
     top_n_components = sitk.Threshold(raw_relabeled, lower=1, upper=MAX_TARGET_LABELS,
                                       outsideValue=0)
-    del raw_relabeled  # [RAM CLEAR]
+    del raw_relabeled  # RAM flush
 
     save_debug("2_pre_healed_components", sitk.Cast(top_n_components, sitk.sitkUInt32))
 
     # Convert the Top 5 surviving structures back into a flat binary mask
     logger.info("Re-binarizing the isolated top components...")
     cleaned_binary_mask = sitk.Cast(top_n_components > 0, sitk.sitkUInt8)
-    del top_n_components  # [RAM CLEAR]
 
+    return cleaned_binary_mask
+
+
+def step3_targeted_healing(cleaned_binary_mask):
+    """Applies morphological closing to fuse cracks only on surviving large structures."""
     logger.info("--- STEP 3: Targeted Healing (Morphological Cement) ---")
     logger.info(
         f"Applying Morphological Closing (Radius {CLOSING_RADIUS}) strictly to the top components...")
+
     healed_mask = sitk.BinaryMorphologicalClosing(cleaned_binary_mask,
                                                   (CLOSING_RADIUS, CLOSING_RADIUS, CLOSING_RADIUS))
-    del cleaned_binary_mask  # [RAM CLEAR]
 
     # Sweep up any 1-voxel artifacts created during closing
     healed_mask = sitk.BinaryMorphologicalOpening(healed_mask, (1, 1, 1))
 
+    return healed_mask
+
+
+def step4_final_components(healed_mask, save_debug):
+    """Recalculates the connected components and extracts geometrical statistics."""
     logger.info("--- STEP 4: Final Component Generation ---")
     logger.info("Re-calculating components on the perfectly healed mask...")
+
+    cc_filter = sitk.ConnectedComponentImageFilter()
+    cc_filter.SetFullyConnected(False)
     final_components_raw = cc_filter.Execute(healed_mask)
-    del healed_mask  # [RAM CLEAR]
 
     # Re-sort them by size
     final_components = sitk.RelabelComponent(final_components_raw)
-    del final_components_raw  # [RAM CLEAR]
+    del final_components_raw  # RAM flush
 
     # Generate debug file safely
     top_n_components_debug = sitk.Threshold(final_components, lower=1, upper=MAX_TARGET_LABELS,
                                             outsideValue=0)
     save_debug("3_post_healed_components", sitk.Cast(top_n_components_debug, sitk.sitkUInt32))
-    del top_n_components_debug  # [RAM CLEAR]
+    del top_n_components_debug  # RAM flush
 
     cc_stats = sitk.LabelShapeStatisticsImageFilter()
     cc_stats.Execute(final_components)
 
+    return final_components, cc_stats
+
+
+def step5_centroid_lock(img, final_components, cc_stats, lumen_binary, safe_zone, save_debug):
+    """Identifies the true capsule using a Search Ring and Centroid proximity to the Lumen."""
     logger.info("--- STEP 5: The Centroid Lock (Intelligent Targeting) ---")
     logger.info(
         f"Using a {SEARCH_RING_RADIUS}-voxel search net and Centroid Lock to find the true capsule...")
 
+    # Create the search ring
     dilated_lumen = sitk.BinaryDilate(lumen_binary,
                                       (SEARCH_RING_RADIUS, SEARCH_RING_RADIUS, SEARCH_RING_RADIUS))
     search_ring = dilated_lumen * safe_zone
-    del dilated_lumen  # [RAM CLEAR]
+    del dilated_lumen  # RAM flush
 
     save_debug("4_search_ring", sitk.Cast(search_ring, sitk.sitkUInt8))
 
+    # Isolate touching pixels
     overlap_img = final_components * sitk.Cast(search_ring, final_components.GetPixelID())
-    del search_ring  # [RAM CLEAR]
+    del search_ring  # RAM flush
 
     save_debug("5_overlap_contacts", sitk.Cast(overlap_img > 0, sitk.sitkUInt8))
 
     overlap_stats = sitk.LabelShapeStatisticsImageFilter()
     overlap_stats.Execute(overlap_img)
-    del overlap_img  # [RAM CLEAR]
+    del overlap_img  # RAM flush
 
+    # Calculate lumen center of gravity
     lumen_stats = sitk.LabelShapeStatisticsImageFilter()
     lumen_stats.Execute(lumen_binary)
 
@@ -117,7 +143,7 @@ def isolate_capsule(img, lower_thresh, lumen_img, save_debug):
     best_label = 0
     min_dist = float('inf')
 
-    # Only loop through the surviving labels
+    # Only loop through the top N massive surviving labels
     top_labels = [l for l in cc_stats.GetLabels() if 0 < l <= MAX_TARGET_LABELS]
 
     for label in top_labels:
@@ -142,6 +168,42 @@ def isolate_capsule(img, lower_thresh, lumen_img, save_debug):
     else:
         logger.info(f"  -> Locked onto capsule (Label {best_label}) via Centroid Proximity.")
         target_capsule = final_components == best_label
+
+    return target_capsule
+
+
+# =====================================================================
+# PIPELINE STAGE 2: ORCHESTRATION & EXPORT
+# =====================================================================
+
+def isolate_capsule(img, lower_thresh, lumen_img, save_debug):
+    """
+    Orchestrates the sequence of the Two-Pass 'Pre-Targeted Healing' architecture,
+    managing state and aggressively flushing RAM between steps.
+    """
+
+    # Step 1: Exclusion
+    binary_mask, lumen_binary, safe_zone = step1_raw_exclusion(img, lower_thresh, lumen_img,
+                                                               save_debug)
+
+    # Step 2: Dust Filter
+    cleaned_binary_mask = step2_pre_filter_dust(binary_mask, save_debug)
+    del binary_mask  # [RAM CLEAR]
+
+    # Step 3: Heal
+    healed_mask = step3_targeted_healing(cleaned_binary_mask)
+    del cleaned_binary_mask  # [RAM CLEAR]
+
+    # Step 4: Components
+    final_components, cc_stats = step4_final_components(healed_mask, save_debug)
+    del healed_mask  # [RAM CLEAR]
+
+    # Step 5: Target Lock
+    target_capsule = step5_centroid_lock(img, final_components, cc_stats, lumen_binary, safe_zone,
+                                         save_debug)
+
+    # Final [RAM CLEAR]
+    del final_components, cc_stats, lumen_binary, safe_zone
 
     return target_capsule
 
