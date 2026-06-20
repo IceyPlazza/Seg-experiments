@@ -1,15 +1,9 @@
 import SimpleITK as sitk
 import argparse
 import sys
-import os
 import math
 import logging
-
-# --- ALGORITHM CONSTANTS ---
-MIN_CAPSULE_VOXELS = 500  # Minimum size to prevent locking onto microscopic dust
-SEARCH_RING_RADIUS = 15  # How far to expand the lumen to reach the capsule
-CLOSING_RADIUS = 2  # Radius to fuse shattered capsule fragments
-MAX_TARGET_LABELS = 5  # Restrict targeting to only the N largest components
+from pathlib import Path
 
 # --- LOGGER SETUP ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(name)s %(levelname)s %(message)s')
@@ -38,91 +32,48 @@ def step1_raw_exclusion(img, lower_thresh, lumen_img, save_debug):
     return binary_mask, lumen_binary, safe_zone
 
 
-def step2_pre_filter_dust(binary_mask, save_debug):
-    """Isolates the largest structures to delete microscopic background dust."""
-    logger.info("--- STEP 2: Pre-Filtering (The Dust Sweep) ---")
-    logger.info("Filtering background dust before applying morphological cement...")
+def step2_extract_components(binary_mask, max_labels, save_debug):
+    """Isolates and measures the largest structures, deleting microscopic dust."""
+    logger.info("--- STEP 2: Component Extraction & Dust Filter ---")
+
     cc_filter = sitk.ConnectedComponentImageFilter()
     cc_filter.SetFullyConnected(False)
-
     raw_components = cc_filter.Execute(binary_mask)
 
-    # Sort by size and isolate ONLY the Top 5 largest structures
-    raw_relabeled = sitk.RelabelComponent(raw_components)
+    # Sort by size
+    final_components_raw = sitk.RelabelComponent(raw_components)
     del raw_components  # RAM flush
 
-    top_n_components = sitk.Threshold(raw_relabeled, lower=1, upper=MAX_TARGET_LABELS,
-                                      outsideValue=0)
-    del raw_relabeled  # RAM flush
-
-    save_debug("2_pre_healed_components", sitk.Cast(top_n_components, sitk.sitkUInt32))
-
-    # Convert the Top 5 surviving structures back into a flat binary mask
-    logger.info("Re-binarizing the isolated top components...")
-    cleaned_binary_mask = sitk.Cast(top_n_components > 0, sitk.sitkUInt8)
-
-    return cleaned_binary_mask
-
-
-def step3_targeted_healing(cleaned_binary_mask):
-    """Applies morphological closing to fuse cracks only on surviving large structures."""
-    logger.info("--- STEP 3: Targeted Healing (Morphological Cement) ---")
-    logger.info(
-        f"Applying Morphological Closing (Radius {CLOSING_RADIUS}) strictly to the top components...")
-
-    healed_mask = sitk.BinaryMorphologicalClosing(cleaned_binary_mask,
-                                                  (CLOSING_RADIUS, CLOSING_RADIUS, CLOSING_RADIUS))
-
-    # Sweep up any 1-voxel artifacts created during closing
-    healed_mask = sitk.BinaryMorphologicalOpening(healed_mask, (1, 1, 1))
-
-    return healed_mask
-
-
-def step4_final_components(healed_mask, save_debug):
-    """Recalculates the connected components and extracts geometrical statistics."""
-    logger.info("--- STEP 4: Final Component Generation ---")
-    logger.info("Re-calculating components on the perfectly healed mask...")
-
-    cc_filter = sitk.ConnectedComponentImageFilter()
-    cc_filter.SetFullyConnected(False)
-    final_components_raw = cc_filter.Execute(healed_mask)
-
-    # Re-sort them by size
-    final_components = sitk.RelabelComponent(final_components_raw)
+    # Isolate ONLY the Top N largest structures to permanently delete dust
+    final_components = sitk.Threshold(final_components_raw, lower=1, upper=max_labels, outsideValue=0)
     del final_components_raw  # RAM flush
 
-    # Generate debug file safely
-    top_n_components_debug = sitk.Threshold(final_components, lower=1, upper=MAX_TARGET_LABELS,
-                                            outsideValue=0)
-    save_debug("3_post_healed_components", sitk.Cast(top_n_components_debug, sitk.sitkUInt32))
-    del top_n_components_debug  # RAM flush
+    save_debug("2_filtered_components", final_components)
 
+    # Calculate statistics only for the surviving top components
     cc_stats = sitk.LabelShapeStatisticsImageFilter()
     cc_stats.Execute(final_components)
 
     return final_components, cc_stats
 
 
-def step5_centroid_lock(img, final_components, cc_stats, lumen_binary, safe_zone, save_debug):
+def step3_centroid_lock(img, final_components, cc_stats, lumen_binary, safe_zone,
+                        min_voxels, search_radius, max_labels, save_debug):
     """Identifies the true capsule using a Search Ring and Centroid proximity to the Lumen."""
-    logger.info("--- STEP 5: The Centroid Lock (Intelligent Targeting) ---")
-    logger.info(
-        f"Using a {SEARCH_RING_RADIUS}-voxel search net and Centroid Lock to find the true capsule...")
+    logger.info("--- STEP 3: The Centroid Lock (Intelligent Targeting) ---")
 
-    # Create the search ring
-    dilated_lumen = sitk.BinaryDilate(lumen_binary,
-                                      (SEARCH_RING_RADIUS, SEARCH_RING_RADIUS, SEARCH_RING_RADIUS))
+    logger.info(f"Using a {search_radius}-voxel search net...")
+    dilated_lumen = sitk.BinaryDilate(lumen_binary, (search_radius, search_radius, search_radius))
     search_ring = dilated_lumen * safe_zone
     del dilated_lumen  # RAM flush
 
-    save_debug("4_search_ring", sitk.Cast(search_ring, sitk.sitkUInt8))
+    save_debug("3_search_ring", search_ring)
 
-    # Isolate touching pixels
-    overlap_img = final_components * sitk.Cast(search_ring, final_components.GetPixelID())
+    # Use sitk.Mask to avoid memory blowout
+    overlap_img = sitk.Mask(final_components, search_ring)
     del search_ring  # RAM flush
 
-    save_debug("5_overlap_contacts", sitk.Cast(overlap_img > 0, sitk.sitkUInt8))
+    save_debug("4_overlap_contacts", sitk.Cast(overlap_img > 0, sitk.sitkUInt8))
 
     overlap_stats = sitk.LabelShapeStatisticsImageFilter()
     overlap_stats.Execute(overlap_img)
@@ -132,10 +83,12 @@ def step5_centroid_lock(img, final_components, cc_stats, lumen_binary, safe_zone
     lumen_stats = sitk.LabelShapeStatisticsImageFilter()
     lumen_stats.Execute(lumen_binary)
 
-    if lumen_stats.HasLabel(1):
-        target_center = lumen_stats.GetCentroid(1)
+    lumen_labels = lumen_stats.GetLabels()
+    if lumen_labels:
+        # Safely grab the first available label (usually the only one in a binary mask)
+        target_center = lumen_stats.GetCentroid(lumen_labels[0])
     else:
-        logger.warning("Provided lumen mask is empty! Falling back to absolute image center.")
+        logger.warning("Provided lumen mask is empty! ...")
         size = img.GetSize()
         target_center = img.TransformIndexToPhysicalPoint(
             [size[0] // 2, size[1] // 2, size[2] // 2])
@@ -143,11 +96,11 @@ def step5_centroid_lock(img, final_components, cc_stats, lumen_binary, safe_zone
     best_label = 0
     min_dist = float('inf')
 
-    # Only loop through the top N massive surviving labels
-    top_labels = [l for l in cc_stats.GetLabels() if 0 < l <= MAX_TARGET_LABELS]
+    # Loop through the surviving labels
+    top_labels = [l for l in cc_stats.GetLabels() if 0 < l <= max_labels]
 
     for label in top_labels:
-        if cc_stats.GetNumberOfPixels(label) < MIN_CAPSULE_VOXELS:
+        if cc_stats.GetNumberOfPixels(label) < min_voxels:
             continue
 
         if not overlap_stats.HasLabel(label):
@@ -176,87 +129,79 @@ def step5_centroid_lock(img, final_components, cc_stats, lumen_binary, safe_zone
 # PIPELINE STAGE 2: ORCHESTRATION & EXPORT
 # =====================================================================
 
-def isolate_capsule(img, lower_thresh, lumen_img, save_debug):
-    """
-    Orchestrates the sequence of the Two-Pass 'Pre-Targeted Healing' architecture,
-    managing state and aggressively flushing RAM between steps.
-    """
+def isolate_capsule(img, lower_thresh, lumen_img, min_voxels, search_radius, max_labels, save_debug):
+    # Step 1: Exclusion (Unchanged)
+    binary_mask, lumen_binary, safe_zone = step1_raw_exclusion(img, lower_thresh, lumen_img, save_debug)
 
-    # Step 1: Exclusion
-    binary_mask, lumen_binary, safe_zone = step1_raw_exclusion(img, lower_thresh, lumen_img,
-                                                               save_debug)
-
-    # Step 2: Dust Filter
-    cleaned_binary_mask = step2_pre_filter_dust(binary_mask, save_debug)
+    # Step 2: Extract Components (Needs max_labels)
+    final_components, cc_stats = step2_extract_components(binary_mask, max_labels, save_debug)
     del binary_mask  # [RAM CLEAR]
 
-    # Step 3: Heal
-    healed_mask = step3_targeted_healing(cleaned_binary_mask)
-    del cleaned_binary_mask  # [RAM CLEAR]
+    # Step 3: Target Lock (Needs all three)
+    target_capsule = step3_centroid_lock(
+        img, final_components, cc_stats, lumen_binary, safe_zone,
+        min_voxels, search_radius, max_labels, save_debug
+    )
 
-    # Step 4: Components
-    final_components, cc_stats = step4_final_components(healed_mask, save_debug)
-    del healed_mask  # [RAM CLEAR]
-
-    # Step 5: Target Lock
-    target_capsule = step5_centroid_lock(img, final_components, cc_stats, lumen_binary, safe_zone,
-                                         save_debug)
-
-    # Final [RAM CLEAR]
     del final_components, cc_stats, lumen_binary, safe_zone
-
     return target_capsule
 
 
 def auto_segment_capsule(args):
-    input_path = os.path.abspath(args.input)
+    input_path = Path(args.input).resolve()
 
-    if not os.path.exists(input_path):
+    if not input_path.exists():
         logger.error(f"The input scan '{input_path}' was not found.")
-        sys.exit(1)
+        raise FileNotFoundError(f"Missing input scan: {input_path}")
 
-    input_dir = os.path.dirname(input_path)
-    base_filename = os.path.basename(input_path)
+    input_dir = input_path.parent
+    filename = input_path.name
 
-    if base_filename.endswith('_0000.nii.gz'):
-        clean_name = base_filename[:-12]
-    elif base_filename.endswith('.nii.gz'):
-        clean_name = base_filename[:-7]
+    # Clean up standard medical imaging suffixes
+    if filename.endswith('_0000.nii.gz'):
+        clean_name = filename[:-12]
+    elif filename.endswith('.nii.gz'):
+        clean_name = filename[:-7]
     else:
-        clean_name = os.path.splitext(base_filename)[0]
+        clean_name = input_path.stem
 
     # --- DEBUG FOLDER SETUP ---
     debug_dir = None
     if args.generate_files:
-        debug_dir = os.path.join(input_dir, f"{clean_name}_capsule_debug")
-        os.makedirs(debug_dir, exist_ok=True)
+        debug_dir = input_dir / f"{clean_name}_capsule_debug"
+        debug_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"Debug mode enabled. Intermediate files will be saved to: {debug_dir}")
 
     def save_debug(key: str, img: sitk.Image):
         if debug_dir:
-            out_path = os.path.join(debug_dir, f"{key}.nii.gz")
+            out_path = debug_dir / f"{key}.nii.gz"
             logger.info(f"  -> Generating debug file: {out_path}...")
-            sitk.WriteImage(img, out_path)
+            # Convert Path to string for SimpleITK compatibility
+            sitk.WriteImage(img, str(out_path))
 
     try:
         logger.info(f"Loading raw scan '{input_path}'...")
-        img = sitk.ReadImage(input_path)
+        img = sitk.ReadImage(str(input_path))
 
-        lumen_path = os.path.abspath(args.lumen_mask)
-        if not os.path.exists(lumen_path):
+        lumen_path = Path(args.lumen_mask).resolve()
+        if not lumen_path.exists():
             logger.error(f"The required lumen mask '{lumen_path}' was not found.")
-            sys.exit(1)
+            raise FileNotFoundError(f"Missing lumen mask: {lumen_path}")
 
         logger.info(f"Loading lumen mask '{lumen_path}'...")
-        lumen_img = sitk.ReadImage(lumen_path)
+        lumen_img = sitk.ReadImage(str(lumen_path))
 
         if lumen_img.GetSize() != img.GetSize():
             logger.error(
                 "Dimension mismatch! The lumen mask does not match the raw scan dimensions.")
-            sys.exit(1)
+            raise ValueError("Dimension mismatch between input and lumen mask.")
 
         logger.info("=== PIPELINE STAGE 1: ISOLATE CAPSULE ===")
-        capsule_mask = isolate_capsule(img, args.threshold, lumen_img, save_debug)
+        # Note: Passes the new CLI arguments into the logic pipeline
+        capsule_mask = isolate_capsule(
+            img, args.threshold, lumen_img,
+            args.min_voxels, args.search_radius, args.max_labels, save_debug
+        )
 
         logger.info("=== PIPELINE STAGE 2: FORMAT AND EXPORT ===")
         logger.info("Applying final label and realigning metadata...")
@@ -265,59 +210,84 @@ def auto_segment_capsule(args):
         final_mask.CopyInformation(img)
 
         # Standard capsule export path
-        capsule_out_path = args.output if args.output else os.path.join(input_dir,
-                                                                        f"{clean_name}_capsule_mask.nii.gz")
+        if args.output:
+            capsule_out_path = Path(args.output)
+        else:
+            capsule_out_path = input_dir / f"{clean_name}_capsule_mask.nii.gz"
 
         logger.info(f"Saving isolated capsule mask to '{capsule_out_path}'...")
-        sitk.WriteImage(final_mask, capsule_out_path)
+        sitk.WriteImage(final_mask, str(capsule_out_path))
 
-        # Additional combined export path if flag is present
+        # Additional combined export path
         if args.combine:
             logger.info("--- Combine Flag Detected ---")
             logger.info("Combining Capsule and Lumen masks into a single volume...")
-            lumen_img_8bit = sitk.Cast(lumen_img, sitk.sitkUInt8)
-            combined_mask = final_mask + lumen_img_8bit
 
-            # Smart dynamic naming to ensure the combined mask gets a distinct file name
+            # --- COLLISION FIX ---
+            # Enforce a safe label for the lumen to ensure it doesn't overwrite the capsule
+            safe_lumen_label = args.label + 1 if args.label == 1 else 1
+            logger.info(
+                f"Assigning Lumen to label {safe_lumen_label} to prevent collision with Capsule (label {args.label}).")
+
+            # Binarize lumen (>0) to strip old labels, then multiply by the new safe label
+            lumen_img_8bit = sitk.Cast(lumen_img > 0, sitk.sitkUInt8) * safe_lumen_label
+
+            combined_mask = final_mask + lumen_img_8bit
+            combined_mask.CopyInformation(img)
+
+            # Smart dynamic naming using pathlib's with_name
             if args.output:
-                base, ext = os.path.splitext(args.output)
-                if args.output.endswith('.nii.gz'):
-                    base = args.output[:-7]
-                    ext = '.nii.gz'
-                combined_out_path = f"{base}_combined{ext}"
+                if capsule_out_path.name.endswith('.nii.gz'):
+                    combined_filename = f"{capsule_out_path.name[:-7]}_combined.nii.gz"
+                    combined_out_path = capsule_out_path.with_name(combined_filename)
+                else:
+                    # Fallback for standard single-extensions like .nrrd or .mha
+                    combined_out_path = capsule_out_path.with_name(
+                        f"{capsule_out_path.stem}_combined{capsule_out_path.suffix}")
             else:
-                combined_out_path = os.path.join(input_dir, f"{clean_name}_combined_mask.nii.gz")
+                combined_out_path = input_dir / f"{clean_name}_combined_mask.nii.gz"
 
             logger.info(f"Saving combined mask to '{combined_out_path}'...")
-            sitk.WriteImage(combined_mask, combined_out_path)
+            sitk.WriteImage(combined_mask, str(combined_out_path))
 
         logger.info("Processing complete!")
 
     except Exception as e:
         logger.error(f"An error occurred during processing: {e}")
-        sys.exit(1)
+        raise
 
 
 def main():
     parser = argparse.ArgumentParser(
         description="High-Contrast Prostate Capsule Segmentation with Sequential Exclusion.")
 
+    # Existing arguments
     parser.add_argument("-i", "--input", required=True, help="Path to raw scan (REQUIRED)")
     parser.add_argument("-m", "--lumen_mask", required=True,
-                        help="Path to the previously generated lumen mask to act as an exclusion zone (REQUIRED)")
+                        help="Path to the lumen mask exclusion zone (REQUIRED)")
     parser.add_argument("-o", "--output", default=None,
-                        help="Path to save final mask (Optional: defaults to input directory)")
+                        help="Path to save final mask (Optional)")
     parser.add_argument("-c", "--combine", action="store_true",
-                        help="Combine the generated capsule mask and the provided lumen mask into one file.")
+                        help="Combine capsule and lumen masks into one file.")
     parser.add_argument("-l", "--label", type=int, default=1,
                         help="Int; Label number to apply to the capsule (default: 1)")
-    parser.add_argument("-t", "--threshold", type=float, default=200.0,
-                        help="Float; Lower intensity limit for the capsule (default: 200.0)")
+    parser.add_argument("-t", "--threshold", type=float, default=300.0,
+                        help="Float; Lower intensity limit for the capsule (default: 300.0)")
     parser.add_argument("-g", "--generate_files", action="store_true",
-                        help="Generate intermediate debug files for troubleshooting.")
+                        help="Generate intermediate debug files.")
+    parser.add_argument("--min_voxels", type=int, default=500,
+                        help="Int; Minimum size to prevent locking onto microscopic dust (default: 500)")
+    parser.add_argument("--search_radius", type=int, default=15,
+                        help="Int; Voxel radius to expand the lumen to reach the capsule (default: 15)")
+    parser.add_argument("--max_labels", type=int, default=5,
+                        help="Int; Restrict targeting to only the N largest components (default: 5)")
 
     args = parser.parse_args()
-    auto_segment_capsule(args)
+
+    try:
+        auto_segment_capsule(args)
+    except Exception:
+        sys.exit(1)  # Bubble up the exit cleanly
 
 
 if __name__ == "__main__":
