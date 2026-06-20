@@ -125,26 +125,93 @@ def step3_centroid_lock(img, final_components, cc_stats, lumen_binary, safe_zone
     return target_capsule
 
 
+def step4_distance_map_closing(target_capsule, patch_radius, save_debug):
+    """
+    Streamlined Distance Map Patching:
+    1. Maurer Distance Maps to bridge massive gaps with high memory efficiency.
+    2. Localized morphological closing to smooth surface artifacts and clean up the grid.
+    """
+    if patch_radius <= 0:
+        logger.info("--- STEP 4: Distance Map Patching [SKIPPED] ---")
+        return target_capsule
+
+    logger.info("--- STEP 4: Streamlined Distance Map Patching ---")
+
+    # DEBUG: The absolute baseline right before we alter the topology
+    save_debug("4b_base_target_capsule", sitk.Cast(target_capsule, sitk.sitkUInt8))
+
+    # ==========================================================
+    # PHASE 1-3: Maurer Distance Map (Bridging Massive Holes)
+    # ==========================================================
+    logger.info(f"Phase 1: Applying Distance-Based massive bridge (Radius {patch_radius})...")
+    distance_filter = sitk.SignedMaurerDistanceMapImageFilter()
+    distance_filter.SetUseImageSpacing(False)
+    distance_filter.SetSquaredDistance(False)
+
+    dist_map = distance_filter.Execute(target_capsule)
+    dilated_capsule = dist_map <= patch_radius
+    del dist_map  # [RAM CLEAR]
+
+    # DEBUG: See the massive blob before it shrinks
+    save_debug("5a_dist_dilated", sitk.Cast(dilated_capsule, sitk.sitkUInt8))
+
+    dist_map = distance_filter.Execute(dilated_capsule)
+    del dilated_capsule  # [RAM CLEAR]
+
+    eroded_capsule = dist_map < -patch_radius
+    del dist_map  # [RAM CLEAR]
+
+    # DEBUG: See the raw shrink-wrapped result
+    save_debug("5b_dist_eroded", sitk.Cast(eroded_capsule, sitk.sitkUInt8))
+
+    bridged_capsule = eroded_capsule | target_capsule
+    del eroded_capsule  # [RAM CLEAR]
+
+    # DEBUG: See the distance map output combined with the ground-truth capsule
+    save_debug("5c_dist_bridged", sitk.Cast(bridged_capsule, sitk.sitkUInt8))
+
+    # ==========================================================
+    # PHASE 4: Anti-Aliasing & Surface Cleanup
+    # ==========================================================
+    logger.info("Phase 2: Applying localized morphological closing for surface cleanup...")
+    # A tight radius of 3 acts like a trowel, smoothing the voxel "stair-steps"
+    # and paving over any remaining small surface ravines left by the distance map.
+    final_capsule = sitk.BinaryMorphologicalClosing(bridged_capsule, (3, 3, 3))
+
+    # DEBUG: The final, polished output
+    save_debug("5d_final_patched_shell", sitk.Cast(final_capsule, sitk.sitkUInt8))
+
+    return final_capsule
+
 # =====================================================================
 # PIPELINE STAGE 2: ORCHESTRATION & EXPORT
 # =====================================================================
 
-def isolate_capsule(img, lower_thresh, lumen_img, min_voxels, search_radius, max_labels, save_debug):
-    # Step 1: Exclusion (Unchanged)
-    binary_mask, lumen_binary, safe_zone = step1_raw_exclusion(img, lower_thresh, lumen_img, save_debug)
+def isolate_capsule(img, lower_thresh, lumen_img, min_voxels, search_radius, max_labels,
+                    patch_radius, save_debug):
+    # Step 1: Exclusion
+    binary_mask, lumen_binary, safe_zone = step1_raw_exclusion(img, lower_thresh, lumen_img,
+                                                               save_debug)
 
-    # Step 2: Extract Components (Needs max_labels)
+    # Step 2: Extract Components
     final_components, cc_stats = step2_extract_components(binary_mask, max_labels, save_debug)
     del binary_mask  # [RAM CLEAR]
 
-    # Step 3: Target Lock (Needs all three)
+    # Step 3: Target Lock
     target_capsule = step3_centroid_lock(
         img, final_components, cc_stats, lumen_binary, safe_zone,
         min_voxels, search_radius, max_labels, save_debug
     )
+    # Note: We NO LONGER delete lumen_binary here so we can pass it to Step 4!
+    del final_components, cc_stats, safe_zone  # [RAM CLEAR]
 
-    del final_components, cc_stats, lumen_binary, safe_zone
-    return target_capsule
+    # Step 4: Distance Map Patch (Removed lumen_binary argument)
+    patched_capsule = step4_distance_map_closing(target_capsule, patch_radius, save_debug)
+
+    # Final cleanup
+    del target_capsule, lumen_binary
+
+    return patched_capsule
 
 
 def auto_segment_capsule(args):
@@ -197,10 +264,10 @@ def auto_segment_capsule(args):
             raise ValueError("Dimension mismatch between input and lumen mask.")
 
         logger.info("=== PIPELINE STAGE 1: ISOLATE CAPSULE ===")
-        # Note: Passes the new CLI arguments into the logic pipeline
         capsule_mask = isolate_capsule(
             img, args.threshold, lumen_img,
-            args.min_voxels, args.search_radius, args.max_labels, save_debug
+            args.min_voxels, args.search_radius, args.max_labels,
+            args.patch_radius, save_debug
         )
 
         logger.info("=== PIPELINE STAGE 2: FORMAT AND EXPORT ===")
@@ -281,6 +348,8 @@ def main():
                         help="Int; Voxel radius to expand the lumen to reach the capsule (default: 15)")
     parser.add_argument("--max_labels", type=int, default=5,
                         help="Int; Restrict targeting to only the N largest components (default: 5)")
+    parser.add_argument("-p","--patch_radius", type=int, default=15,
+                        help="Int; Voxel radius for democratic voting hole patching (default: 2. Set to 0 to disable).")
 
     args = parser.parse_args()
 
