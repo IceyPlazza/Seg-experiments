@@ -9,6 +9,9 @@ from typing import Callable, Tuple, List
 # --- LOGGER SETUP ---
 logger = logging.getLogger(__name__)
 
+CAPSULE_LABEL = 1
+LUMEN_LABEL = 2
+
 # =====================================================================
 # PIPELINE STAGE 1: CORE ALGORITHM METHODS
 # =====================================================================
@@ -94,7 +97,6 @@ def extract_largest_components(
 
 
 def lock_onto_target_centroid(
-        img: sitk.Image,
         final_components: sitk.Image,
         cc_stats: sitk.LabelShapeStatisticsImageFilter,
         lumen_binary: sitk.Image,
@@ -109,7 +111,6 @@ def lock_onto_target_centroid(
     and measuring mathematical proximity to the lumen's center of gravity.
 
     Args:
-        img: The raw input medical scan (used for physical coordinate conversions).
         final_components: Labeled image of the top connected components.
         cc_stats: Statistics filter containing data for the final_components.
         lumen_binary: The binarized lumen mask.
@@ -145,13 +146,9 @@ def lock_onto_target_centroid(
     lumen_stats.Execute(lumen_binary)
     lumen_labels = lumen_stats.GetLabels()
 
-    if lumen_labels:
-        target_center = lumen_stats.GetCentroid(lumen_labels[0])
-    else:
-        logger.warning("Provided lumen mask is empty! Falling back to absolute image center.")
-        size = img.GetSize()
-        target_center = img.TransformIndexToPhysicalPoint(
-            [size[0] // 2, size[1] // 2, size[2] // 2])
+    if not lumen_labels:
+        raise ValueError("Provided lumen mask is empty. A valid lumen mask is required.")
+    target_center = lumen_stats.GetCentroid(lumen_labels[0])
 
     # 4. Evaluate candidates against the target center
     best_label = 0
@@ -173,12 +170,11 @@ def lock_onto_target_centroid(
 
     # 5. Lock and isolate
     if best_label == 0:
-        logger.warning(
-            "No valid capsule found touching the lumen! Falling back to largest component.")
-        target_capsule = final_components == 1
-    else:
-        logger.info(f"  -> Locked onto capsule (Label {best_label}) via Centroid Proximity.")
-        target_capsule = final_components == best_label
+        raise ValueError(
+            "No valid capsule component found touching the lumen search ring. "
+            "Try increasing --search_radius or --max_labels.")
+    logger.info(f"  -> Locked onto capsule (Label {best_label}) via Centroid Proximity.")
+    target_capsule = final_components == best_label
 
     return target_capsule
 
@@ -208,7 +204,6 @@ def bridge_planar_gaps(target_capsule: sitk.Image, patch_radius: int,
 
     logger.info(f"Applying massive 2D planar bridge (Radius {patch_radius}) to seal gaps...")
     close_filter = sitk.BinaryMorphologicalClosingImageFilter()
-    # Z-radius of 0 physically prevents the patch from building caps over the apex/base
     close_filter.SetKernelRadius([patch_radius, patch_radius, 0])
     close_filter.SetKernelType(sitk.sitkBall)
     bridged_native = close_filter.Execute(solid_native)
@@ -288,7 +283,7 @@ def isolate_capsule(
     del binary_mask  # [RAM CLEAR]
 
     target_capsule = lock_onto_target_centroid(
-        img, final_components, cc_stats, lumen_binary, safe_zone,
+        final_components, cc_stats, lumen_binary, safe_zone,
         min_voxels, search_radius, max_labels, save_debug
     )
     del final_components, cc_stats, safe_zone  # [RAM CLEAR]
@@ -325,8 +320,7 @@ def export_results(
     """
     logger.info("\nApplying final label and realigning metadata...\n")
 
-    # Cast to UInt16 to prevent overflow if args.label > 255
-    labeled_mask = sitk.Cast(final_mask, sitk.sitkUInt16) * args.label
+    labeled_mask = sitk.Cast(final_mask, sitk.sitkUInt16) * CAPSULE_LABEL
     labeled_mask.CopyInformation(img)
 
     # 1. Export standard capsule mask
@@ -338,28 +332,21 @@ def export_results(
 
     # 2. Export Combined Mask (if requested)
     if args.combine:
-        logger.info("Combining Capsule and Lumen masks into a single volume...")
-
-        # Enforce a safe label for the lumen to ensure it doesn't collide with the capsule
-        safe_lumen_label = args.label + 1 if args.label == 1 else 1
         logger.info(
-            f"Assigning Lumen to label {safe_lumen_label} to prevent collision with Capsule (label {args.label}).")
+            f"Combining masks: Capsule=label {CAPSULE_LABEL}, Lumen=label {LUMEN_LABEL}...")
 
-        # Re-enforce safe zone on the final mask in case mathematical bloating bled into the lumen
-        lumen_binary_16bit = sitk.Cast(lumen_img > 0, sitk.sitkUInt16)
+        # Re-enforce safe zone in case morphological ops bled into the lumen
         safe_zone_16bit = sitk.Cast(lumen_img == 0, sitk.sitkUInt16)
-
         safe_capsule_mask = labeled_mask * safe_zone_16bit
-        lumen_img_16bit = lumen_binary_16bit * safe_lumen_label
+        lumen_img_16bit = sitk.Cast(lumen_img, sitk.sitkUInt16)
 
-        # Combine safely and realign metadata
         combined_mask = safe_capsule_mask + lumen_img_16bit
         combined_mask.CopyInformation(img)
 
         # Handle filename logic
         if args.output:
-            combined_filename = f"{capsule_out_path.name.split('.')[0]}_combined.nii.gz"
-            combined_out_path = capsule_out_path.with_name(combined_filename)
+            stem = capsule_out_path.name.removesuffix('.nii.gz').removesuffix('.nii')
+            combined_out_path = capsule_out_path.with_name(f"{stem}_combined.nii.gz")
         else:
             combined_out_path = input_dir / f"{clean_name}_combined_mask.nii.gz"
 
@@ -417,6 +404,14 @@ def auto_segment_capsule(args: argparse.Namespace) -> None:
             logger.error("Dimension mismatch! The lumen mask does not match raw scan dimensions.")
             raise ValueError("Dimension mismatch between input and lumen mask.")
 
+        if not all(math.isclose(a, b, rel_tol=1e-3) for a, b in zip(img.GetSpacing(), lumen_img.GetSpacing())):
+            logger.error("Spacing mismatch! The lumen mask spacing does not match the raw scan.")
+            raise ValueError("Spacing mismatch between input scan and lumen mask.")
+
+        if not all(math.isclose(a, b, abs_tol=0.5) for a, b in zip(img.GetOrigin(), lumen_img.GetOrigin())):
+            logger.error("Origin mismatch! The lumen mask origin does not match the raw scan.")
+            raise ValueError("Origin mismatch between input scan and lumen mask.")
+
         # Run Segmentation Pipeline
         capsule_mask = isolate_capsule(
             img, args.threshold, lumen_img,
@@ -449,8 +444,6 @@ def main():
                         help="Path to save final mask (Optional)")
     parser.add_argument("-c", "--combine", action="store_true",
                         help="Combine capsule and lumen masks into one file.")
-    parser.add_argument("-l", "--label", type=int, default=1,
-                        help="Int; Label number to apply to the capsule (default: 1)")
     parser.add_argument("-t", "--threshold", type=float, default=300.0,
                         help="Float; Lower intensity limit for the capsule (default: 300.0)")
     parser.add_argument("-g", "--generate_files", action="store_true",
