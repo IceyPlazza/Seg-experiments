@@ -470,6 +470,7 @@ def shave_faces(internal_air, shave_global, dynamic_shave_top, dynamic_shave_bot
     disconnected_air = sitk.ConstantPad(shaved_air, lower_shave_bounds, upper_shave_bounds, 0)
 
     logger.info("Filtering disconnected components...")
+    disconnected_air = sitk.BinaryMorphologicalOpening(disconnected_air, (1,1,1))
     cc_filter = sitk.ConnectedComponentImageFilter()
     cc_filter.SetFullyConnected(False)
     air_components = cc_filter.Execute(disconnected_air)
